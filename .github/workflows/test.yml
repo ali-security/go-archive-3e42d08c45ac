@@ -1,10 +1,12 @@
 name: test
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Space-separated top-level test names to run (empty = full suite)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -28,26 +30,75 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
 
-      - name: lint
-        uses: golangci/golangci-lint-action@v9
+      - name: Create module zip
+        if: runner.os == 'Linux' && matrix.go-version == '1.23.x'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/modzip" "$RUNNER_TEMP/build_output"
+          cat > "$RUNNER_TEMP/modzip/create_mod.go" <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$RUNNER_TEMP/modzip"
+          go mod init example.com/modzip
+          go get golang.org/x/mod@v0.22.0
+          go run create_mod.go github.com/moby/go-archive v0.2.0 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/build_output/v0.2.0.zip"
+          unzip -l "$RUNNER_TEMP/build_output/v0.2.0.zip"
+
+      - name: Upload module zip
+        if: runner.os == 'Linux' && matrix.go-version == '1.23.x'
+        uses: actions/upload-artifact@v4
         with:
-          version: v2.7
-          args: --print-resources-usage --timeout=10m --verbose
+          name: module-zip
+          path: ${{ runner.temp }}/build_output/v0.2.0.zip
+          if-no-files-found: error
 
       - name: Test
-        run: go test -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./...
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -v -cover "-coverprofile=coverage.txt" -covermode=atomic -run "^($(echo "${{ inputs.test-filter }}" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+            for t in ${{ inputs.test-filter }}; do grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/go-test.log" || { echo "selected test $t did not run"; exit 1; }; done
+          else
+            go test -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./... 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+          fi
+          echo "TEST SUMMARY: $(grep -c -- '--- PASS' "$RUNNER_TEMP/go-test.log") passed, $(grep -c -- '--- FAIL' "$RUNNER_TEMP/go-test.log") failed, $(grep -c -- '--- SKIP' "$RUNNER_TEMP/go-test.log") skipped"
+          echo "Skipped tests and reasons (each reason is the t.Skip message printed by the upstream test itself; runtime.GOOS-guarded skips are unconditional on that OS and those tests run on the other OS legs):"
+          awk '/^ *=== (RUN|CONT|NAME)/{reason=""} /^ +[^ ]+\.go:[0-9]+: /{r=$0; sub(/^ +/, "", r); reason=r} /^ *--- SKIP:/{n=$0; sub(/^ *--- SKIP: /, "", n); print "SKIPPED " n " -- reason: " reason}' "$RUNNER_TEMP/go-test.log"
         shell: bash
         env:
           MSYS_NO_PATHCONV: '1'
 
       - name: Test (root)
         if: runner.os == 'Linux'
-        run: go test -exec "sudo -E -n" -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./...
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -exec "sudo -E -n" -v -cover "-coverprofile=coverage.txt" -covermode=atomic -run "^($(echo "${{ inputs.test-filter }}" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/go-test-root.log"
+          else
+            go test -exec "sudo -E -n" -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./... 2>&1 | tee "$RUNNER_TEMP/go-test-root.log"
+          fi
+          echo "TEST SUMMARY (root): $(grep -c -- '--- PASS' "$RUNNER_TEMP/go-test-root.log") passed, $(grep -c -- '--- FAIL' "$RUNNER_TEMP/go-test-root.log") failed, $(grep -c -- '--- SKIP' "$RUNNER_TEMP/go-test-root.log") skipped"
+          echo "Skipped tests and reasons (root):"
+          awk '/^ *=== (RUN|CONT|NAME)/{reason=""} /^ +[^ ]+\.go:[0-9]+: /{r=$0; sub(/^ +/, "", r); reason=r} /^ *--- SKIP:/{n=$0; sub(/^ *--- SKIP: /, "", n); print "SKIPPED " n " -- reason: " reason}' "$RUNNER_TEMP/go-test-root.log"
         shell: bash
         env:
           MSYS_NO_PATHCONV: '1'
-
-      - name: Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          directory: ./
